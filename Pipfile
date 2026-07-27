@@ -10,3 +10,7 @@ pypdf = "*"
 
 [requires]
 python_version = "3.11"
+
+[scripts]
+rename = "python rename_meisai_with_date.py"
+extract = "python extract_je_usage_csv.py"

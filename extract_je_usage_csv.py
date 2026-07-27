@@ -12,9 +12,9 @@ from pathlib import Path
 
 from pypdf import PdfReader
 
-HEADER = ["月", "日", "種別", "利用駅", "種別", "利用駅", "残高", "入金・利用額"]
+HEADER = ["年", "月", "日", "種別", "利用駅", "種別", "利用駅", "残高", "入金・利用額"]
 
-ISSUE_DATE_PATTERN = re.compile(r"(20[0-9]{2})/([0-9]{1,2})/([0-9]{1,2})")
+DATE_PATTERN = re.compile(r"(20[0-9]{2})/([0-9]{1,2})/([0-9]{1,2})")
 # Examples:
 # -14612 入 御徒町 出 秋葉原 \1,99826
 # +3,00012 VIEW モバイル \4,09826
@@ -26,6 +26,7 @@ CARRY_PATTERN = re.compile(r"^([0-9]{2})\s+(.+?)\s+\\([0-9,]+)([0-9]{2})$")
 
 @dataclass(frozen=True)
 class UsageRow:
+    year: str
     month: str
     day: str
     type1: str
@@ -38,6 +39,7 @@ class UsageRow:
 
     def as_csv_row(self) -> list[str]:
         return [
+            self.year,
             self.month,
             self.day,
             self.type1,
@@ -49,7 +51,17 @@ class UsageRow:
         ]
 
     def dedupe_key(self) -> tuple[str, ...]:
-        return tuple(self.as_csv_row())
+        # 旧CSVに年列がないため、マージ時は年を除外して重複判定する。
+        return (
+            self.month,
+            self.day,
+            self.type1,
+            self.station1,
+            self.type2,
+            self.station2,
+            self.balance,
+            self.amount,
+        )
 
 
 def normalize_spaces(text: str) -> str:
@@ -82,28 +94,113 @@ def parse_middle_segment(segment: str) -> tuple[str, str, str, str]:
     return tokens[0], "", "", ""
 
 
-def extract_issue_date(text: str) -> date | None:
-    matches = list(ISSUE_DATE_PATTERN.finditer(text))
-    if not matches:
-        return None
-
-    y, m, d = matches[-1].groups()
+def _build_date(y: str, m: str, d: str) -> date | None:
     try:
         return date(int(y), int(m), int(d))
     except ValueError:
         return None
 
 
-def infer_year(issue: date | None, month: int) -> int | None:
-    if issue is None:
+def extract_statement_date(text: str) -> date | None:
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+
+    # 優先: 明細ヘッダ付近の案内文を含むブロックの日付
+    # 例: 2026/6/21 の直後に「ご利用ありがとうございます。」が続く
+    for i, line in enumerate(lines):
+        m = DATE_PATTERN.search(line)
+        if not m:
+            continue
+
+        window = " ".join(lines[i + 1 : i + 4])
+        if "ご利用ありがとうございます" in window or "最新のご利用明細" in window:
+            y, mo, d = m.groups()
+            dt = _build_date(y, mo, d)
+            if dt is not None:
+                return dt
+
+    # 次点: 発行日時ラベル近傍の日付
+    for i, line in enumerate(lines):
+        if "発行日時" not in line:
+            continue
+        for candidate in lines[max(0, i - 1) : i + 3]:
+            m = DATE_PATTERN.search(candidate)
+            if not m:
+                continue
+            y, mo, d = m.groups()
+            dt = _build_date(y, mo, d)
+            if dt is not None:
+                return dt
+
+    # 最終フォールバック: 文書内の最後の日付
+    matches = list(DATE_PATTERN.finditer(text))
+    if not matches:
         return None
-    # Suica残高履歴は通常、発行月以前の履歴を含む。
-    # 発行月より大きい月は前年とみなす。
-    return issue.year - 1 if month > issue.month else issue.year
+
+    y, m, d = matches[-1].groups()
+    return _build_date(y, m, d)
+
+
+def apply_years_by_row_order(rows: list[UsageRow], statement_date: date | None) -> list[UsageRow]:
+    if not rows:
+        return rows
+
+    if statement_date is None:
+        return rows
+
+    def assign_from_newest_to_oldest(src_rows: list[UsageRow]) -> list[UsageRow]:
+        current_year = statement_date.year
+        first_md = (int(src_rows[0].month), int(src_rows[0].day))
+        statement_md = (statement_date.month, statement_date.day)
+        if first_md > statement_md:
+            current_year -= 1
+
+        rewritten: list[UsageRow] = []
+        prev_md: tuple[int, int] | None = None
+
+        for row in src_rows:
+            current_md = (int(row.month), int(row.day))
+            if prev_md is not None and current_md > prev_md:
+                # 新しい順で並ぶ前提: 月日が増えたら前年へロールオーバー。
+                current_year -= 1
+
+            rewritten.append(
+                UsageRow(
+                    year=f"{current_year:04d}",
+                    month=row.month,
+                    day=row.day,
+                    type1=row.type1,
+                    station1=row.station1,
+                    type2=row.type2,
+                    station2=row.station2,
+                    balance=row.balance,
+                    amount=row.amount,
+                    sort_date=date(current_year, int(row.month), int(row.day)),
+                )
+            )
+            prev_md = current_md
+
+        return rewritten
+
+    inc = 0
+    dec = 0
+    for i in range(1, len(rows)):
+        prev_md = (int(rows[i - 1].month), int(rows[i - 1].day))
+        cur_md = (int(rows[i].month), int(rows[i].day))
+        if cur_md > prev_md:
+            inc += 1
+        elif cur_md < prev_md:
+            dec += 1
+
+    # 増加が多い場合は古い順とみなし、反転して同じロジックを適用する。
+    if inc > dec:
+        reversed_assigned = assign_from_newest_to_oldest(list(reversed(rows)))
+        return list(reversed(reversed_assigned))
+
+    return assign_from_newest_to_oldest(rows)
 
 
 def parse_usage_rows_from_text(text: str, source: Path) -> list[UsageRow]:
-    issue = extract_issue_date(text)
+    statement_date = extract_statement_date(text)
     rows: list[UsageRow] = []
 
     for raw_line in text.splitlines():
@@ -120,10 +217,8 @@ def parse_usage_rows_from_text(text: str, source: Path) -> list[UsageRow]:
             balance = balance_raw.replace(",", "")
             type1, station1, type2, station2 = parse_middle_segment(middle)
 
-            year = infer_year(issue, int(month))
-            sort_value = date(year, int(month), int(day)) if year is not None else None
             rows.append(
-                UsageRow(month, day, type1, station1, type2, station2, balance, amount, sort_value)
+                UsageRow("", month, day, type1, station1, type2, station2, balance, amount, None)
             )
             continue
 
@@ -135,12 +230,13 @@ def parse_usage_rows_from_text(text: str, source: Path) -> list[UsageRow]:
             balance = balance_raw.replace(",", "")
             kind = normalize_spaces(kind_raw)
 
-            year = infer_year(issue, int(month))
-            sort_value = date(year, int(month), int(day)) if year is not None else None
-            rows.append(UsageRow(month, day, kind, "", "", "", balance, "", sort_value))
+            rows.append(UsageRow("", month, day, kind, "", "", "", balance, "", None))
 
     if not rows:
         print(f"Warn: no usage rows parsed from {source.name}", file=sys.stderr)
+        return rows
+
+    rows = apply_years_by_row_order(rows, statement_date)
 
     return rows
 
@@ -179,6 +275,7 @@ def load_existing_csv(csv_path: Path) -> list[UsageRow]:
                 continue
             rows.append(
                 UsageRow(
+                    year=(item.get("年") or "").strip(),
                     month=f"{int(month):02d}",
                     day=f"{int(day):02d}",
                     type1=(item.get("種別") or "").strip(),
@@ -193,31 +290,14 @@ def load_existing_csv(csv_path: Path) -> list[UsageRow]:
     return rows
 
 
-def sort_key(row: UsageRow) -> tuple[int, int, int, str, str, str, str, str, str]:
+def sort_key(row: UsageRow) -> tuple[int, int, int]:
     if row.sort_date is not None:
-        return (
-            row.sort_date.year,
-            row.sort_date.month,
-            row.sort_date.day,
-            row.type1,
-            row.station1,
-            row.type2,
-            row.station2,
-            row.balance,
-            row.amount,
-        )
+        return (row.sort_date.year, row.sort_date.month, row.sort_date.day)
 
-    return (
-        9999,
-        int(row.month),
-        int(row.day),
-        row.type1,
-        row.station1,
-        row.type2,
-        row.station2,
-        row.balance,
-        row.amount,
-    )
+    if row.year:
+        return (int(row.year), int(row.month), int(row.day))
+
+    return (9999, int(row.month), int(row.day))
 
 
 def merge_dedupe_sort(existing: list[UsageRow], new_rows: list[UsageRow]) -> list[UsageRow]:
@@ -235,6 +315,7 @@ def merge_dedupe_sort(existing: list[UsageRow], new_rows: list[UsageRow]) -> lis
         seen[row.dedupe_key()] = row
 
     merged.extend(seen.values())
+    # Pythonのsortは安定ソートなので、同日内は元の出現順を維持する。
     merged.sort(key=sort_key)
     return merged
 

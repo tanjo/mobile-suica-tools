@@ -51,8 +51,10 @@ class UsageRow:
         ]
 
     def dedupe_key(self) -> tuple[str, ...]:
-        # 旧CSVに年列がないため、マージ時は年を除外して重複判定する。
+        # 年・月・日・種別・駅・残高・入金・利用額をすべて含めて同じ行を判定する。
+        # これにより同日同ルートの別取引を別行として保持できる。
         return (
+            self.year,
             self.month,
             self.day,
             self.type1,
@@ -62,6 +64,27 @@ class UsageRow:
             self.balance,
             self.amount,
         )
+
+    def _int_value(self, value: str) -> int | None:
+        if not value:
+            return None
+        try:
+            return int(value.replace(",", ""))
+        except ValueError:
+            return None
+
+    def balance_value(self) -> int | None:
+        return self._int_value(self.balance)
+
+    def amount_value(self) -> int | None:
+        return self._int_value(self.amount)
+
+    def prev_balance_value(self) -> int | None:
+        balance = self.balance_value()
+        amount = self.amount_value()
+        if balance is None or amount is None:
+            return None
+        return balance - amount
 
 
 def normalize_spaces(text: str) -> str:
@@ -290,34 +313,108 @@ def load_existing_csv(csv_path: Path) -> list[UsageRow]:
     return rows
 
 
-def sort_key(row: UsageRow) -> tuple[int, int, int]:
+def sort_key(row: UsageRow) -> tuple[int, int, int, int, int, int, str, str, str, str, str]:
     if row.sort_date is not None:
-        return (row.sort_date.year, row.sort_date.month, row.sort_date.day)
+        return (
+            row.sort_date.year,
+            row.sort_date.month,
+            row.sort_date.day,
+            0,
+            0,
+            0,
+            row.type1,
+            row.station1,
+            row.type2,
+            row.station2,
+            row.amount,
+        )
 
     if row.year:
-        return (int(row.year), int(row.month), int(row.day))
+        return (
+            int(row.year),
+            int(row.month),
+            int(row.day),
+            0,
+            0,
+            0,
+            row.type1,
+            row.station1,
+            row.type2,
+            row.station2,
+            row.amount,
+        )
 
-    return (9999, int(row.month), int(row.day))
+    return (
+        9999,
+        int(row.month),
+        int(row.day),
+        0,
+        0,
+        0,
+        row.type1,
+        row.station1,
+        row.type2,
+        row.station2,
+        row.amount,
+    )
+
+
+def reorder_same_date_group(rows: list[UsageRow], prev_balance: int | None) -> list[UsageRow]:
+    if len(rows) <= 1:
+        return rows
+
+    chain: list[UsageRow] = []
+    remaining = set(rows)
+
+    current_balance = prev_balance
+    while remaining:
+        candidates = [r for r in remaining if r.prev_balance_value() == current_balance]
+        if not candidates:
+            break
+        next_row = min(candidates, key=lambda r: (r.balance_value() or 0, r.amount_value() or 0, r.type1, r.station1, r.type2, r.station2))
+        chain.append(next_row)
+        remaining.remove(next_row)
+        current_balance = next_row.balance_value()
+
+    if len(chain) == len(rows):
+        return chain
+
+    return sorted(rows, key=lambda r: (r.prev_balance_value() or 0, r.balance_value() or 0, r.amount_value() or 0, r.type1, r.station1, r.type2, r.station2))
+
+
+def sort_rows(rows: list[UsageRow]) -> list[UsageRow]:
+    rows = sorted(rows, key=sort_key)
+    grouped: list[UsageRow] = []
+    i = 0
+    while i < len(rows):
+        group = [rows[i]]
+        j = i + 1
+        while j < len(rows) and rows[j].year == rows[i].year and rows[j].month == rows[i].month and rows[j].day == rows[i].day:
+            group.append(rows[j])
+            j += 1
+
+        prev_balance = grouped[-1].balance_value() if grouped and grouped[-1].balance_value() is not None else None
+        grouped.extend(reorder_same_date_group(group, prev_balance))
+        i = j
+
+    return grouped
 
 
 def merge_dedupe_sort(existing: list[UsageRow], new_rows: list[UsageRow]) -> list[UsageRow]:
     merged: list[UsageRow] = []
     seen: dict[tuple[str, ...], UsageRow] = {}
 
-    # Existing rows first, then overwrite with new rows when same key appears
-    # so newly parsed rows can contribute sort_date.
+    # 既存データを保持し、重複がない新規行のみ追加する。
     for row in existing:
+        seen[row.dedupe_key()] = row
+
+    for row in new_rows:
         key = row.dedupe_key()
         if key not in seen:
             seen[key] = row
 
-    for row in new_rows:
-        seen[row.dedupe_key()] = row
-
     merged.extend(seen.values())
-    # Pythonのsortは安定ソートなので、同日内は元の出現順を維持する。
-    merged.sort(key=sort_key)
-    return merged
+    return sort_rows(merged)
 
 
 def write_csv(csv_path: Path, rows: list[UsageRow]) -> None:

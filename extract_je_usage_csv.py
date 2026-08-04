@@ -288,25 +288,33 @@ def load_existing_csv(csv_path: Path) -> list[UsageRow]:
 
     rows: list[UsageRow] = []
     with csv_path.open("r", encoding="utf-8-sig", newline="") as f:
-        reader = csv.DictReader(f)
-        for item in reader:
-            if item is None:
+        reader = csv.reader(f)
+        headers = next(reader, None)
+        if headers is None:
+            return []
+
+        for row in reader:
+            if not row:
                 continue
-            month = (item.get("月") or "").strip()
-            day = (item.get("日") or "").strip()
+            row = [cell.strip() for cell in row]
+            if len(row) < 9:
+                row += [""] * (9 - len(row))
+
+            year, month, day, type1, station1, type2, station2, balance, amount = row[:9]
             if not month or not day:
                 continue
+
             rows.append(
                 UsageRow(
-                    year=(item.get("年") or "").strip(),
+                    year=year,
                     month=f"{int(month):02d}",
                     day=f"{int(day):02d}",
-                    type1=(item.get("種別") or "").strip(),
-                    station1=(item.get("利用駅") or "").strip(),
-                    type2=(item.get("種別.1") or item.get("種別_2") or "").strip(),
-                    station2=(item.get("利用駅.1") or item.get("利用駅_2") or "").strip(),
-                    balance=(item.get("残高") or "").strip(),
-                    amount=(item.get("入金・利用額") or "").strip(),
+                    type1=type1,
+                    station1=station1,
+                    type2=type2,
+                    station2=station2,
+                    balance=balance,
+                    amount=amount,
                     sort_date=None,
                 )
             )

@@ -371,23 +371,64 @@ def reorder_same_date_group(rows: list[UsageRow], prev_balance: int | None) -> l
     if len(rows) <= 1:
         return rows
 
-    chain: list[UsageRow] = []
-    remaining = set(rows)
+    carry_rows = [r for r in rows if r.type1 == "繰"]
+    normal_rows = [r for r in rows if r.type1 != "繰"]
 
-    current_balance = prev_balance
-    while remaining:
-        candidates = [r for r in remaining if r.prev_balance_value() == current_balance]
-        if not candidates:
-            break
-        next_row = min(candidates, key=lambda r: (r.balance_value() or 0, r.amount_value() or 0, r.type1, r.station1, r.type2, r.station2))
-        chain.append(next_row)
-        remaining.remove(next_row)
-        current_balance = next_row.balance_value()
+    def build_chain(src_rows: list[UsageRow], start_balance: int | None) -> list[UsageRow]:
+        chain: list[UsageRow] = []
+        remaining = set(src_rows)
+        current_balance = start_balance
 
-    if len(chain) == len(rows):
-        return chain
+        while remaining:
+            candidates = [r for r in remaining if r.prev_balance_value() == current_balance]
+            if not candidates:
+                break
+            next_row = min(
+                candidates,
+                key=lambda r: (
+                    r.balance_value() or 0,
+                    r.amount_value() or 0,
+                    r.type1,
+                    r.station1,
+                    r.type2,
+                    r.station2,
+                ),
+            )
+            chain.append(next_row)
+            remaining.remove(next_row)
+            current_balance = next_row.balance_value()
 
-    return sorted(rows, key=lambda r: (r.prev_balance_value() or 0, r.balance_value() or 0, r.amount_value() or 0, r.type1, r.station1, r.type2, r.station2))
+        if len(chain) == len(src_rows):
+            return chain
+
+        return sorted(
+            src_rows,
+            key=lambda r: (
+                r.prev_balance_value() or 0,
+                r.balance_value() or 0,
+                r.amount_value() or 0,
+                r.type1,
+                r.station1,
+                r.type2,
+                r.station2,
+            ),
+        )
+
+    ordered = build_chain(normal_rows, prev_balance)
+
+    for carry in carry_rows:
+        inserted = False
+        carry_balance = carry.balance_value()
+        if carry_balance is not None:
+            for index, existing in enumerate(ordered):
+                if existing.balance_value() == carry_balance:
+                    ordered.insert(index + 1, carry)
+                    inserted = True
+                    break
+        if not inserted:
+            ordered.append(carry)
+
+    return ordered
 
 
 def sort_rows(rows: list[UsageRow]) -> list[UsageRow]:

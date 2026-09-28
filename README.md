@@ -97,3 +97,28 @@ pipenv run python rename_meisai_with_date.py
 - 年が期待とずれる場合:
 	- 基準日候補となる本文日付が想定どおりに入っているか確認してください
 	- 年またぎ判定は「行順」と「月日の逆転」を使います
+
+## おまけ
+### .git/pre-push
+CSV の履歴をコミットして残したい場合、.git/pre-push フックを利用して push することを防止できます。
+
+例として、 `history` ブランチにCSVの履歴を保存している場合の設定例を示します。
+
+以下の内容を `.git/pre-push` に記述してください。
+
+```bash
+#!/bin/sh
+
+protected_branch="history"
+current_branch=$(git symbolic-ref --short HEAD)
+
+if [ "$current_branch" = "$protected_branch" ]; then
+  echo "You are trying to push to the protected branch '$protected_branch'."
+  echo "Please switch to a different branch before pushing."
+  exit 1
+fi
+
+exit 0
+```
+
+これによって `history` ブランチへの push が制限され、CSV の履歴を誤って公の場で公開してしまうことを防止できます。
